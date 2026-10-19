@@ -1,0 +1,357 @@
+# Slop Build: the shared build recipe (docs/ARCHITECTURE.md §6.2, docs/SECURITY.md §5.1).
+#
+# Makers call this reusable workflow from a ~15-line file in their repo (see examples/). It runs
+# on the maker's own GitHub Actions minutes and:
+#   1. builds the app for each platform on GitHub-hosted runners,
+#   2. packs each build (Windows: a .zip; Linux: a .tar.gz plus .deb and .rpm packages) and
+#      signs every file with a GitHub artifact attestation (Sigstore), which records that this
+#      recipe built it from the maker's repo at this commit,
+#   3. attaches the files to a release on the maker's repo (Slop stores no builds),
+#   4. tells Slop, using the run's GitHub OIDC token instead of any secret.
+#
+# This recipe is trusted by every app built with it. Changes need two-person review, releases are
+# tagged, and makers pin a tag (SECURITY §5.1). It never handles Slop secrets.
+
+name: Slop Build
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: The app's address on Slop (its slug).
+        required: true
+        type: string
+      slop-url:
+        description: The Slop site, e.g. https://slop.example
+        required: true
+        type: string
+      project-type:
+        description: rust, go or custom.
+        required: true
+        type: string
+      platforms:
+        description: Comma-separated platforms to build, from windows and linux.
+        required: false
+        type: string
+        default: windows,linux
+      linux-packages:
+        description: >-
+          Comma-separated Linux packages to make besides the .tar.gz, from deb and rpm. Slop uses
+          the ones your store page lists and ignores the rest.
+        required: false
+        type: string
+        default: deb,rpm
+      build-command:
+        description: "custom only: the command that builds the app (run with bash)."
+        required: false
+        type: string
+        default: ""
+      output-dir:
+        description: "custom only: the folder the build command produces."
+        required: false
+        type: string
+        default: ""
+      sign:
+        description: >-
+          Sign each build with a GitHub artifact attestation (the maker's signature Slop requires).
+          Attestations in private repositories need GitHub Enterprise Cloud, so private test
+          setups turn this off and run Slop with SLOP_REQUIRE_MAKER_SIGNATURE=false.
+        required: false
+        type: boolean
+        default: true
+      exec:
+        description: >-
+          custom only: the program to start, relative to output-dir. "{ext}" becomes .exe on
+          Windows. For rust and go this is worked out automatically.
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: slop-build-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check inputs
+        env:
+          APP: ${{ inputs.app }}
+          TYPE: ${{ inputs.project-type }}
+          SLOP_URL: ${{ inputs.slop-url }}
+        run: |
+          [[ "$APP" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::app must be your app's Slop address, e.g. my-game"; exit 1; }
+          [[ "$TYPE" =~ ^(rust|go|custom)$ ]] || { echo "::error::project-type must be rust, go or custom"; exit 1; }
+          [[ "$SLOP_URL" =~ ^https?://[^/]+/?$ ]] || { echo "::error::slop-url must be a site address like https://slop.example"; exit 1; }
+
+      - name: Choose version and release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN: ${{ github.run_number }}
+        run: |
+          # A tag push builds that tag; anything else gets a numbered build release.
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"; version="${REF_NAME#v}"
+          else
+            tag="slop-build-$RUN"; version="build.$RUN"
+          fi
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$version" --notes "Built by Slop Build from ${GITHUB_SHA}."
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Choose platforms
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          runners = {"windows": "windows-latest", "linux": "ubuntu-latest"}
+          wanted = [p.strip() for p in os.environ["PLATFORMS"].split(",") if p.strip()]
+          bad = [p for p in wanted if p not in runners]
+          if bad or not wanted:
+              raise SystemExit(f"::error::unknown platforms: {bad}")
+          print("matrix=" + json.dumps({"include": [{"platform": p, "runner": runners[p]} for p in wanted]}))
+          PY
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        if: inputs.project-type == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          TYPE: ${{ inputs.project-type }}
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+          EXEC: ${{ inputs.exec }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          ext=""; [ "$PLATFORM" = "windows" ] && ext=".exe"
+          mkdir -p slop-dist/app
+          case "$TYPE" in
+            rust)
+              cargo build --release --locked
+              # The first binary target of the workspace's packages.
+              name=$(cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          meta = json.load(sys.stdin)
+          bins = [t["name"] for p in meta["packages"] for t in p["targets"] if "bin" in t["kind"]]
+          if not bins: raise SystemExit("no binary target in Cargo.toml")
+          print(bins[0])')
+              cp "target/release/$name$ext" slop-dist/app/
+              exec="$name$ext"
+              ;;
+            go)
+              go build -trimpath -o "slop-dist/app/$REPO_NAME$ext" .
+              exec="$REPO_NAME$ext"
+              ;;
+            custom)
+              [ -n "$BUILD_COMMAND" ] && [ -n "$OUTPUT_DIR" ] && [ -n "$EXEC" ] || {
+                echo "::error::custom builds need build-command, output-dir and exec"; exit 1; }
+              bash -euo pipefail -c "$BUILD_COMMAND"
+              cp -R "$OUTPUT_DIR"/. slop-dist/app/
+              exec="${EXEC//\{ext\}/$ext}"
+              ;;
+          esac
+          [ -f "slop-dist/app/$exec" ] || { echo "::error::the build has no $exec"; exit 1; }
+          echo "SLOP_EXEC=$exec" >> "$GITHUB_ENV"
+
+      - name: Package
+        env:
+          APP: ${{ inputs.app }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p slop-dist/out
+          python3 - <<'PY'
+          # Windows: a .zip. Linux: a .tar.gz. Both keep the program's execute permission.
+          import json, os, stat, tarfile, zipfile
+          app, platform, version, exe = (os.environ[k] for k in ("APP", "PLATFORM", "VERSION", "SLOP_EXEC"))
+          root = os.path.join("slop-dist", "app")
+          entries = []
+          for folder, _, files in os.walk(root):
+              for f in sorted(files):
+                  path = os.path.join(folder, f)
+                  rel = os.path.relpath(path, root).replace(os.sep, "/")
+                  if os.path.islink(path):
+                      raise SystemExit(f"::error::symbolic links can't be shipped: {rel}")
+                  mode = 0o755 if (rel == exe or os.stat(path).st_mode & stat.S_IXUSR) else 0o644
+                  entries.append((path, rel, mode))
+          if platform == "windows":
+              name = f"{app}-{version}-windows.zip"
+              with zipfile.ZipFile(os.path.join("slop-dist", "out", name), "w", zipfile.ZIP_DEFLATED) as z:
+                  for path, rel, mode in entries:
+                      info = zipfile.ZipInfo.from_file(path, rel)
+                      info.external_attr = (stat.S_IFREG | mode) << 16
+                      with open(path, "rb") as fh:
+                          z.writestr(info, fh.read(), zipfile.ZIP_DEFLATED)
+          else:
+              name = f"{app}-{version}-linux-x86_64.tar.gz"
+              with tarfile.open(os.path.join("slop-dist", "out", name), "w:gz", format=tarfile.PAX_FORMAT) as t:
+                  for path, rel, mode in entries:
+                      info = t.gettarinfo(path, rel)
+                      info.mode, info.uid, info.gid, info.uname, info.gname = mode, 0, 0, "", ""
+                      with open(path, "rb") as fh:
+                          t.addfile(info, fh)
+          files = [{"platform": platform, "file_name": name, "exec": exe}]
+          with open(os.path.join("slop-dist", "files.json"), "w") as fh:
+              json.dump(files, fh)
+          print(f"packed {name}")
+          PY
+
+      - name: Linux packages (.deb, .rpm)
+        if: matrix.platform == 'linux'
+        env:
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PACKAGES: ${{ inputs.linux-packages }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          # The app goes in /opt/<app>, with /usr/bin/<app> starting it.
+          [[ "$PACKAGES" =~ ^((deb|rpm)(,(deb|rpm))*)?$ ]] || { echo "::error::linux-packages takes deb and/or rpm"; exit 1; }
+          # Package versions must start with a digit (build.12 becomes 0.0~build.12).
+          pkgver="$VERSION"; [[ "$pkgver" =~ ^[0-9] ]] || pkgver="0.0~$pkgver"
+          stage=$(mktemp -d)
+          chmod 755 "$stage"
+          mkdir -p "$stage/opt/$APP" "$stage/usr/bin"
+          cp -R slop-dist/app/. "$stage/opt/$APP/"
+          chmod -R u+rwX,go+rX,go-w "$stage/opt"
+          chmod 755 "$stage/opt/$APP/$SLOP_EXEC"
+          ln -s "/opt/$APP/$SLOP_EXEC" "$stage/usr/bin/$APP"
+          if [[ ",$PACKAGES," == *",deb,"* ]]; then
+            mkdir -p "$stage/DEBIAN"
+            printf 'Package: %s\nVersion: %s\nArchitecture: amd64\nMaintainer: %s\nHomepage: %s\nDescription: %s, built by Slop Build\n' \
+              "$APP" "$pkgver" "$GITHUB_REPOSITORY_OWNER" "$REPO_URL" "$APP" > "$stage/DEBIAN/control"
+            # File names use the plain version: GitHub renames uploads with characters like "~".
+            name="${APP}_${VERSION}_amd64.deb"
+            dpkg-deb --root-owner-group --build "$stage" "slop-dist/out/$name"
+            rm -rf "$stage/DEBIAN"
+            jq --arg n "$name" '. + [{"platform": "linux-deb", "file_name": $n}]' slop-dist/files.json > f && mv f slop-dist/files.json
+          fi
+          if [[ ",$PACKAGES," == *",rpm,"* ]]; then
+            command -v rpmbuild >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq rpm; }
+            rpmver="${pkgver//-/_}"; rpmver="${rpmver//\~/_}"
+            top=$(mktemp -d)
+            cat > "$top/app.spec" <<SPEC
+          Name: $APP
+          Version: $rpmver
+          Release: 1
+          Summary: $APP, built by Slop Build
+          License: see $REPO_URL
+          URL: $REPO_URL
+          AutoReqProv: no
+          %description
+          $APP, built by Slop Build from $REPO_URL.
+          %install
+          cp -a $stage/. %{buildroot}/
+          %files
+          /opt/$APP
+          /usr/bin/$APP
+          SPEC
+            rpmbuild -bb --define "_topdir $top" --define "_build_id_links none" --target x86_64 "$top/app.spec"
+            name="${APP}-${VERSION}.x86_64.rpm"
+            cp "$top/RPMS/x86_64/${APP}-${rpmver}-1.x86_64.rpm" "slop-dist/out/$name"
+            jq --arg n "$name" '. + [{"platform": "linux-rpm", "file_name": $n}]' slop-dist/files.json > f && mv f slop-dist/files.json
+          fi
+          ls -l slop-dist/out
+
+      - name: Sign (maker's attestation)
+        if: inputs.sign
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: slop-dist/out/*
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release upload "$TAG" slop-dist/out/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Describe the files for Slop
+        run: mv slop-dist/files.json "slop-dist/${{ matrix.platform }}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slop-file-${{ matrix.platform }}
+          path: slop-dist/${{ matrix.platform }}.json
+          retention-days: 1
+
+  notify:
+    name: Tell Slop
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: slop-file-*
+          merge-multiple: true
+          path: slop-files
+
+      - name: Submit the release to Slop
+        env:
+          APP: ${{ inputs.app }}
+          SLOP_URL: ${{ inputs.slop-url }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          # GitHub's OIDC token proves this run is this recipe, in this repo, at this commit.
+          # Slop checks it; no secret is shared.
+          base="${SLOP_URL%/}"
+          token=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$base" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$token"
+          python3 - <<'PY' > body.json
+          import glob, json, os
+          files = [f for p in sorted(glob.glob("slop-files/*.json")) for f in json.load(open(p))]
+          print(json.dumps({"app": os.environ["APP"], "version": os.environ["VERSION"], "tag": os.environ["TAG"],
+                            "commit": os.environ["GITHUB_SHA"], "files": files}))
+          PY
+          status=$(curl -sS -o response.json -w '%{http_code}' -X POST "$base/v1/slop-build/releases" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data @body.json)
+          cat response.json; echo
+          if [ "$status" -ge 300 ]; then
+            echo "::error::Slop refused the release (HTTP $status). See the response above."
+            exit 1
+          fi
+          echo "Submitted to Slop. It's checked and reviewed before players get it."
