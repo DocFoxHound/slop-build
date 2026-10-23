@@ -139,6 +139,29 @@ on:
         required: false
         type: boolean
         default: true
+      linux-runtime:
+        description: >-
+          Optional: "steam-sniper" builds the Linux program inside Valve's Steam Runtime 3 (sniper)
+          SDK, so it runs on older Linux systems too (glibc 2.31 and newer). For rust, go and custom
+          builds; leave empty to build on the runner's Ubuntu.
+        required: false
+        type: string
+        default: ""
+      itch-target:
+        description: >-
+          Optional: also publish each build to your itch.io page, as "user/game" (from the page's
+          address, user.itch.io/game). Windows and Linux go to the windows and linux channels with
+          itch's own tool (butler). Needs the BUTLER_API_KEY secret.
+        required: false
+        type: string
+        default: ""
+      flatpak-app-id:
+        description: >-
+          Optional: a Flatpak app ID, e.g. io.github.you.Game, to attach a draft Flatpak manifest
+          for the Linux build to each release, for you to finish and submit to Flathub.
+        required: false
+        type: string
+        default: ""
       signpath-organization-id:
         description: >-
           Optional: your SignPath organization ID, to sign the Windows program with a free
@@ -158,6 +181,9 @@ on:
         type: string
         default: release-signing
     secrets:
+      BUTLER_API_KEY:
+        description: Your itch.io API key (itch.io → Settings → API keys), only with itch-target.
+        required: false
       SIGNPATH_API_TOKEN:
         description: Your SignPath CI user's API token (only with signpath-organization-id).
         required: false
@@ -197,7 +223,11 @@ jobs:
           APP: ${{ inputs.app }}
           TYPE: ${{ inputs.project-type }}
           SLOP_URL: ${{ inputs.slop-url }}
+          LINUX_RUNTIME: ${{ inputs.linux-runtime }}
         run: |
+          [[ "$LINUX_RUNTIME" =~ ^(|steam-sniper)$ ]] || { echo "::error::linux-runtime is empty or steam-sniper"; exit 1; }
+          if [ -n "$LINUX_RUNTIME" ] && ! [[ "$TYPE" =~ ^(rust|go|custom)$ ]]; then
+            echo "::error::linux-runtime works with rust, go and custom builds"; exit 1; fi
           [[ "$APP" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::app must be your app's Slop address, e.g. my-game"; exit 1; }
           [[ "$TYPE" =~ ^(rust|go|dotnet|godot|unity|web|electron|tauri|python|custom)$ ]] || { echo "::error::project-type must be rust, go, dotnet, godot, unity, web, electron, tauri, python or custom"; exit 1; }
           [[ "$SLOP_URL" =~ ^https?://[^/]+/?$ ]] || { echo "::error::slop-url must be a site address like https://slop.example"; exit 1; }
@@ -254,7 +284,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -282,14 +312,14 @@ jobs:
           docker system prune -af >/dev/null || true
           df -h /
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ inputs.project-path }}/Library
           key: slop-unity-${{ matrix.platform }}-${{ hashFiles(format('{0}/Assets/**', inputs.project-path), format('{0}/Packages/**', inputs.project-path), format('{0}/ProjectSettings/**', inputs.project-path)) }}
           restore-keys: slop-unity-${{ matrix.platform }}-
 
       - name: Build
-        uses: game-ci/unity-builder@v4
+        uses: game-ci/unity-builder@4423ee75828dff56037d1d1cfdac6b68e3a6ba00 # v4
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
@@ -301,7 +331,7 @@ jobs:
           buildName: ${{ inputs.app }}
           buildsPath: slop-unity
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: slop-unity-${{ matrix.platform }}
           path: slop-unity/${{ matrix.platform == 'windows' && 'StandaloneWindows64' || 'StandaloneLinux64' }}
@@ -316,47 +346,48 @@ jobs:
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # The maker's own code runs in this job (build scripts, npm scripts, custom commands), so it
+    # gets no token that could speak for the recipe: no id-token, read-only contents. It hands the
+    # built folder to the release job, which signs, checks and publishes it on a fresh runner.
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Go
         if: inputs.project-type == 'go'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
       - name: Get the Unity build
         if: inputs.project-type == 'unity'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: slop-unity-${{ matrix.platform }}
           path: slop-dist/unity
 
       - name: Set up .NET
         if: inputs.project-type == 'dotnet' || (inputs.project-type == 'godot' && inputs.godot-dotnet)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
 
       - name: Set up Python
         if: inputs.project-type == 'python'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ inputs.python-version }}
 
       - name: Set up Node.js
         if: inputs.project-type == 'electron' || inputs.project-type == 'tauri' || inputs.project-type == 'web'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
 
@@ -372,7 +403,7 @@ jobs:
 
       - name: Cache Rust builds
         if: inputs.project-type == 'rust' || inputs.project-type == 'tauri' || inputs.project-type == 'web'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -433,10 +464,27 @@ jobs:
           DOTNET_PROJECT: ${{ inputs.dotnet-project }}
           GODOT_DOTNET: ${{ inputs.godot-dotnet }}
           PY_WINDOWED: ${{ inputs.python-windowed }}
+          LINUX_RUNTIME: ${{ inputs.linux-runtime }}
         run: |
           ext=""; [ "$PLATFORM" = "windows" ] && ext=".exe"
           out="$PWD/slop-dist/app"
           mkdir -p "$out"
+          # Valve's Steam Runtime 3 (sniper) SDK, pinned to the version and image Slop tested
+          # (examples/slop-pong's tests pass in it). Moving it is a change to this recipe.
+          SNIPER_SDK=registry.gitlab.steamos.cloud/steamrt/sniper/sdk:3.0.20260928.262393@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5
+          # Runs a compile command here, or for Linux with linux-runtime inside the Steam Runtime
+          # SDK, with the repository at the same path, as this user, and extra mounts from $@.
+          compile() {
+            local cmd="$1"; shift
+            if [ "$PLATFORM" != "linux" ] || [ -z "$LINUX_RUNTIME" ]; then
+              bash -euo pipefail -c "$cmd"; return
+            fi
+            mkdir -p "$RUNNER_TEMP/slop-runtime-home"
+            docker run --rm --user "$(id -u):$(id -g)" -e HOME=/slop-home \
+              -v "$RUNNER_TEMP/slop-runtime-home:/slop-home" -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+              -w "$PWD" "$@" "$SNIPER_SDK" \
+              bash -euo pipefail -c "$cmd"
+          }
           # A program inside a folder, for types whose output has one (Electron, PyInstaller).
           find_program() {
             python3 - "$1" "$PLATFORM" <<'PY'
@@ -459,7 +507,12 @@ jobs:
           }
           case "$TYPE" in
             rust)
-              cargo build --release --locked
+              if [ "$PLATFORM" = "linux" ] && [ -n "$LINUX_RUNTIME" ]; then
+                # The runner's Rust needs a newer glibc, so the SDK gets its own (rust-toolchain.toml is honoured).
+                compile 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal; . "$HOME/.cargo/env"; cargo build --release --locked'
+              else
+                cargo build --release --locked
+              fi
               # The first binary target of the workspace's packages.
               name=$(cargo metadata --no-deps --format-version 1 | python3 -c '
           import json, sys
@@ -471,7 +524,11 @@ jobs:
               exec="$name$ext"
               ;;
             go)
-              go build -trimpath -o "$out/$REPO_NAME$ext" .
+              # Go's own tools don't need the system's libraries, so the runner's work in the SDK too.
+              export SLOP_OUT="$out/$REPO_NAME$ext" GOROOT="$(go env GOROOT)"
+              compile 'PATH="$GOROOT/bin:$PATH" go build -trimpath -o "$SLOP_OUT" .' \
+                -e SLOP_OUT -e GOROOT -e GOCACHE=/slop-home/go-cache -e GOMODCACHE=/slop-home/go-mod \
+                -v "$GOROOT:$GOROOT:ro"
               exec="$REPO_NAME$ext"
               ;;
             dotnet)
@@ -637,7 +694,7 @@ jobs:
             custom)
               [ -n "$BUILD_COMMAND" ] && [ -n "$OUTPUT_DIR" ] && [ -n "$EXEC" ] || {
                 echo "::error::custom builds need build-command, output-dir and exec"; exit 1; }
-              bash -euo pipefail -c "$BUILD_COMMAND"
+              compile "$BUILD_COMMAND"
               cp -R "$OUTPUT_DIR"/. "$out/"
               exec="${EXEC//\{ext\}/$ext}"
               ;;
@@ -648,6 +705,8 @@ jobs:
           #   [launch]                 [launch.windows]
           #   exec = "game{ext}"        exec = "Game.exe"
           #   args = ["--fullscreen"]   args = []
+          # and the shared runtimes the Windows build needs, from Slop's list (Slop's /v1/runtimes):
+          #   runtimes = ["vcredist-x64"]
           launch=$(python3 - "$PLATFORM" "$PROJECT" "$ext" <<'PY'
           import json, os, sys, tomllib
           platform, project, ext = sys.argv[1:4]
@@ -667,7 +726,11 @@ jobs:
               raise SystemExit("::error::slop.toml: exec is a string and args a list of strings")
           if len(args) > 16 or any(len(a) > 200 for a in args):
               raise SystemExit("::error::slop.toml: at most 16 arguments of up to 200 characters")
-          print(json.dumps({"exec": exec_.replace("{ext}", ext), "args": args}))
+          # None (not in slop.toml) keeps the last release's runtimes; [] says none.
+          runtimes = cfg.get("runtimes")
+          if runtimes is not None and (not isinstance(runtimes, list) or not all(isinstance(r, str) for r in runtimes)):
+              raise SystemExit("::error::slop.toml: runtimes is a list of runtime IDs, e.g. [\"vcredist-x64\"]")
+          print(json.dumps({"exec": exec_.replace("{ext}", ext), "args": args, "runtimes": runtimes}))
           PY
           )
           toml_exec=$(echo "$launch" | jq -r .exec)
@@ -678,6 +741,94 @@ jobs:
           [ -f "$out/$exec" ] || { echo "::error::the build has no $exec"; exit 1; }
           echo "SLOP_EXEC=$exec" >> "$GITHUB_ENV"
           echo "SLOP_ARGS=$(echo "$launch" | jq -c .args)" >> "$GITHUB_ENV"
+          echo "SLOP_RUNTIMES=$(echo "$launch" | jq -c .runtimes)" >> "$GITHUB_ENV"
+
+      # The release job sees only this archive and these settings, checked before they're used.
+      - name: Hand the build over
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          tar -cf slop-dist/app.tar -C slop-dist app
+          jq -n --arg exec "$SLOP_EXEC" --argjson args "${SLOP_ARGS:-[]}" --argjson runtimes "${SLOP_RUNTIMES:-null}" \
+            --arg deb "${SLOP_DEB_DEPENDS:-}" --arg rpm "${SLOP_RPM_REQUIRES:-}" \
+            '{exec: $exec, args: $args, runtimes: $runtimes, deb_depends: $deb, rpm_requires: $rpm}' > slop-dist/build.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slop-built-${{ matrix.platform }}
+          path: |
+            slop-dist/app.tar
+            slop-dist/build.json
+          retention-days: 1
+
+  release:
+    name: Sign, check and publish (${{ matrix.platform }})
+    needs: [prepare, build]
+    # A fresh runner where no maker code has run: only it holds the OIDC token that speaks for the
+    # recipe, signs attestations and attaches files, and Defender checks the files here.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: slop-built-${{ matrix.platform }}
+          path: slop-dist
+
+      # The build's archive and settings came from the maker's code: check them before use. Paths
+      # stay inside the folder, nothing but plain files, folders and links inside it, and settings
+      # go into the environment only as validated single lines.
+      - name: Take over the build
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, tarfile
+          with tarfile.open("slop-dist/app.tar") as t:
+              for m in t.getmembers():
+                  parts = m.name.split("/")
+                  if m.name.startswith("/") or ".." in parts or parts[0] != "app":
+                      raise SystemExit(f"::error::the build archive has an unexpected path: {m.name!r}")
+                  if not (m.isfile() or m.isdir() or m.issym()):
+                      raise SystemExit(f"::error::the build archive has a special file: {m.name!r}")
+                  if m.issym() and (m.linkname.startswith("/") or ".." in m.linkname.split("/")):
+                      raise SystemExit(f"::error::the build has a link out of its folder: {m.name!r}")
+              try:
+                  t.extractall("slop-dist", filter="data")
+              except TypeError:  # Python before 3.12: the members were checked above
+                  t.extractall("slop-dist")
+          b = json.load(open("slop-dist/build.json"))
+          line = re.compile(r"^[^\x00-\x1f\x7f]*$")
+          exec_ = b.get("exec")
+          if not isinstance(exec_, str) or not exec_ or not line.match(exec_) or exec_.startswith("/") or ".." in exec_.split("/"):
+              raise SystemExit("::error::the build's program path isn't usable")
+          for k in ("deb_depends", "rpm_requires"):
+              if not re.match(r"^[A-Za-z0-9 ,.()<>=_+~:-]*$", b.get(k) or ""):
+                  raise SystemExit(f"::error::unexpected {k}")
+          env = {
+              "SLOP_EXEC": exec_,
+              "SLOP_ARGS": json.dumps(b.get("args") or [], separators=(",", ":")),
+              "SLOP_RUNTIMES": json.dumps(b.get("runtimes"), separators=(",", ":")),
+              "SLOP_DEB_DEPENDS": b.get("deb_depends") or "",
+              "SLOP_RPM_REQUIRES": b.get("rpm_requires") or "",
+          }
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              for k, v in env.items():
+                  if "\n" in v or "\r" in v:
+                      raise SystemExit(f"::error::{k} isn't one line")
+                  if v:
+                      fh.write(f"{k}={v}\n")
+          PY
+          rm -f slop-dist/app.tar slop-dist/build.json
+          [ -f "slop-dist/app/$SLOP_EXEC" ] || { echo "::error::the build has no $SLOP_EXEC"; exit 1; }
 
       # Optional: sign the Windows program with the maker's SignPath Foundation certificate (free
       # for open-source projects). SignPath checks the build came from this repository on GitHub's
@@ -685,7 +836,7 @@ jobs:
       - name: Upload for signing (SignPath)
         id: unsigned
         if: matrix.platform == 'windows' && inputs.signpath-organization-id != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: slop-unsigned-windows
           path: slop-dist/app
@@ -749,6 +900,8 @@ jobs:
                       with open(path, "rb") as fh:
                           t.addfile(info, fh)
           files = [{"platform": platform, "file_name": name, "exec": exe, "args": json.loads(os.environ.get("SLOP_ARGS") or "[]")}]
+          if platform == "windows":
+              files[0]["runtimes"] = json.loads(os.environ.get("SLOP_RUNTIMES") or "null")
           with open(os.path.join("slop-dist", "files.json"), "w") as fh:
               json.dump(files, fh)
           print(f"packed {name}")
@@ -905,7 +1058,7 @@ jobs:
 
       - name: Sign (maker's attestation)
         if: inputs.sign && inputs.publish
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: slop-dist/out/*
 
@@ -916,18 +1069,99 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: gh release upload "$TAG" slop-dist/out/* --repo "$GITHUB_REPOSITORY" --clobber
 
+      # itch.io: the same files, pushed with itch's own tool (butler, pinned and checked).
+      - name: Push to itch.io
+        if: inputs.publish && inputs.itch-target != ''
+        env:
+          ITCH: ${{ inputs.itch-target }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+        run: |
+          [[ "$ITCH" =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$ ]] || { echo "::error::itch-target is user/game, from your page's address"; exit 1; }
+          [ -n "$BUTLER_API_KEY" ] || { echo "::error::itch-target needs the BUTLER_API_KEY secret (itch.io → Settings → API keys)"; exit 1; }
+          python3 - "$PLATFORM" "$RUNNER_TEMP/butler" <<'PY'
+          import hashlib, sys, urllib.request, zipfile, io, os
+          platform, dest = sys.argv[1:3]
+          # butler 15.32.0 from itch.io, checked against the hash Slop recorded.
+          builds = {
+              "linux": ("linux-amd64", "2335971394ef6596f95ded0833e85ee28755e13761716ef4c91d6b11f69162f5"),
+              "windows": ("windows-amd64", "5902c488b86bb3518ca00bf4e706d7687f229e3f0f28653cd943348ea9ec8878"),
+          }
+          os_name, sha = builds[platform]
+          data = urllib.request.urlopen(f"https://broth.itch.zone/butler/{os_name}/15.32.0/archive/default").read()
+          if hashlib.sha256(data).hexdigest() != sha:
+              raise SystemExit("::error::butler's download doesn't match the expected hash; not running it")
+          zipfile.ZipFile(io.BytesIO(data)).extractall(dest)
+          PY
+          butler="$RUNNER_TEMP/butler/butler"; [ "$PLATFORM" = windows ] && butler="$butler.exe"
+          chmod +x "$butler" 2>/dev/null || true
+          "$butler" push slop-dist/app "$ITCH:$PLATFORM" --userversion "$VERSION"
+
+      # A draft Flatpak manifest for the Linux build, for the maker to finish and send to Flathub.
+      - name: Draft Flatpak manifest
+        if: inputs.publish && inputs.flatpak-app-id != '' && matrix.platform == 'linux'
+        env:
+          APP: ${{ inputs.app }}
+          APP_ID: ${{ inputs.flatpak-app-id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$APP_ID" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_-]+){2,}$ ]] || { echo "::error::flatpak-app-id is reverse-DNS, e.g. io.github.you.Game"; exit 1; }
+          python3 - <<'PY' > "slop-dist/$APP_ID.yml"
+          import glob, hashlib, json, os
+          app, app_id, tag, version = (os.environ[k] for k in ("APP", "APP_ID", "TAG", "VERSION"))
+          archive = glob.glob(f"slop-dist/out/{app}-{version}-linux-x86_64.tar.gz")[0]
+          name = os.path.basename(archive)
+          sha = hashlib.sha256(open(archive, "rb").read()).hexdigest()
+          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}/{name}"
+          exe = os.environ["SLOP_EXEC"]
+          print(f"""# Draft made by Slop Build for {app} {version}. Check the permissions (finish-args),
+          # add a metainfo file with screenshots, and follow https://docs.flathub.org/docs/for-app-authors/submission
+          app-id: {app_id}
+          runtime: org.freedesktop.Platform
+          runtime-version: '24.08'
+          sdk: org.freedesktop.Sdk
+          command: {app}
+          finish-args:
+            - --share=ipc
+            - --socket=x11
+            - --socket=wayland
+            - --socket=pulseaudio
+            - --device=dri
+            # - --share=network   # only if it goes online
+          modules:
+            - name: {app}
+              buildsystem: simple
+              build-commands:
+                - mkdir -p /app/lib/{app} /app/bin
+                - cp -r . /app/lib/{app}/
+                - printf '#!/bin/sh\\nexec /app/lib/{app}/{exe} "$@"\\n' > /app/bin/{app}
+                - chmod +x /app/bin/{app}
+              sources:
+                - type: archive
+                  url: {url}
+                  sha256: {sha}
+                  strip-components: 0
+          """)
+          PY
+          gh release upload "$TAG" "slop-dist/$APP_ID.yml" --repo "$GITHUB_REPOSITORY" --clobber
+
       - name: Keep the build (build and check only)
         if: ${{ !inputs.publish }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: slop-build-${{ matrix.platform }}
           path: slop-dist/out
           retention-days: 1
 
       - name: Describe the files for Slop
-        run: mv slop-dist/files.json "slop-dist/${{ matrix.platform }}.json"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: mv slop-dist/files.json "slop-dist/$PLATFORM.json"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: slop-file-${{ matrix.platform }}
           path: slop-dist/${{ matrix.platform }}.json
@@ -940,7 +1174,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -981,7 +1215,7 @@ jobs:
             echo "::warning title=Possible secret in your repository::$f"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: slop-source-checks
           path: slop-checks/source.json
@@ -989,19 +1223,19 @@ jobs:
 
   notify:
     name: Tell Slop
-    needs: [prepare, build, source-checks]
+    needs: [prepare, release, source-checks]
     if: inputs.publish
     runs-on: ubuntu-latest
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: slop-file-*
           merge-multiple: true
           path: slop-files
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: slop-source-checks
           path: slop-checks
@@ -1023,8 +1257,13 @@ jobs:
           import glob, json, os
           files = [f for p in sorted(glob.glob("slop-files/*.json")) for f in json.load(open(p))]
           checks = json.load(open("slop-checks/source.json"))
-          print(json.dumps({"app": os.environ["APP"], "version": os.environ["VERSION"], "tag": os.environ["TAG"],
-                            "commit": os.environ["GITHUB_SHA"], "files": files, "source_checks": checks}))
+          body = {"app": os.environ["APP"], "version": os.environ["VERSION"], "tag": os.environ["TAG"],
+                  "commit": os.environ["GITHUB_SHA"], "files": files, "source_checks": checks}
+          # slop.toml's runtimes travel with the Windows file; Slop takes them for the release.
+          runtimes = [f.pop("runtimes", None) for f in files]
+          if any(r is not None for r in runtimes):
+              body["runtimes"] = next(r for r in runtimes if r is not None)
+          print(json.dumps(body))
           PY
           status=$(curl -sS -o response.json -w '%{http_code}' -X POST "$base/v1/slop-build/releases" \
             -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data @body.json)
